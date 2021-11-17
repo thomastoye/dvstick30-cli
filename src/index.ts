@@ -62,13 +62,41 @@ class DVstick30 {
         await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_RATET')))
     }
 
+    async setRateP() {
+        throw new Error('Not implemented')
+    }
+
+    async init(): Promise<boolean> {
+        const encoderAndDecoderInitialized = '\x03'
+        this.#sp.write(DVstick30.encodePacket(0, Buffer.from('\x0B' + encoderAndDecoderInitialized)))
+        const packet = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_INIT')))
+
+        return (packet as ControlResponseInit).successfulInit
+    }
+
     async getVersion () {
         const versionControl = '\x31'
         this.#sp.write(DVstick30.encodePacket(0, Buffer.from(versionControl)))
 
         const reply = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_VERSTRING')))
-        
+
         return (reply as ControlResponseVersion).versionString
+    }
+
+    async reset() {
+        const reset = '\x33'
+        this.#sp.write(DVstick30.encodePacket(0, Buffer.from(reset)))
+
+        await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_READY')))
+    }
+
+    async getProductId(): Promise<string> {
+        const productId = '\x30'
+        this.#sp.write(DVstick30.encodePacket(0, Buffer.from(productId)))
+
+        const reply = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_PRODID')))
+
+        return (reply as ControlResponseProductId).productId
     }
 
     private addData(buf: Buffer) {
@@ -127,6 +155,12 @@ class DVstick30 {
                 const payload = packet.payload.slice(1)
 
                 switch (fieldIdentifier) {
+                    case 0x30:
+                        return {
+                            type: 'control-response',
+                            controlPacketType: 'PKT_PRODID',
+                            productId: payload.toString('ascii').slice(0, -1)
+                        }
                     case 0x31:
                         return {
                             type: 'control-response',
@@ -137,6 +171,17 @@ class DVstick30 {
                         return {
                             type: 'control-response',
                             controlPacketType: 'PKT_RATET'
+                        }
+                    case 0x0b:
+                        return {
+                            type: 'control-response',
+                            controlPacketType: 'PKT_INIT',
+                            successfulInit: payload.readUInt8() === 0
+                        }
+                    case 0x39:
+                        return {
+                            type: 'control-response',
+                            controlPacketType: 'PKT_READY'
                         }
                 }
 
@@ -155,6 +200,12 @@ const stick = new DVstick30(serialport)
 
 type DecodedPacket = ControlResponse
 
+type ControlResponseProductId = {
+    type: 'control-response'
+    controlPacketType: 'PKT_PRODID'
+    productId: string
+}
+
 type ControlResponseVersion = {
     type: 'control-response'
     controlPacketType: 'PKT_VERSTRING'
@@ -166,7 +217,18 @@ type ControlResponseRateT = {
     controlPacketType: 'PKT_RATET'
 }
 
-type ControlResponse = ControlResponseVersion | ControlResponseRateT | {
+type ControlResponseInit = {
+    type: 'control-response'
+    controlPacketType: 'PKT_INIT'
+    successfulInit: boolean
+}
+
+type ControlResponseReady = {
+    type: 'control-response',
+    controlPacketType: 'PKT_READY'
+}
+
+type ControlResponse = ControlResponseVersion | ControlResponseRateT | ControlResponseProductId | ControlResponseInit | ControlResponseReady | {
     type: 'control-response',
     controlPacketType: 'unknown',
     fieldIdentifier: number,
@@ -175,10 +237,26 @@ type ControlResponse = ControlResponseVersion | ControlResponseRateT | {
 
 stick.packets.subscribe((packet) => console.log(packet))
 
-stick.getVersion().then((version) => console.log(`version is ${version}`))
-stick.setRateT(33)
+; (async () => {
+    try {
+        await stick.reset()
+        const version = await stick.getVersion()
+        console.log(`version is ${version}`)
+    
+        const productId = await stick.getProductId()
+        console.log(`product id is ${productId}`)
+    
+        console.log(`Init result: ${await stick.setRateT(33)}`)
 
-setTimeout(() => serialport.close(), 1000)
+        await stick.init()
+    } catch (err) {
+        console.error(err)
+    } finally {
+        serialport.close()
+    }
+})()
+
+
 
 // self._device_name = device
 // self._baudrate = baudrate
