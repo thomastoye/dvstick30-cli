@@ -3,6 +3,23 @@ import SerialPort from 'serialport'
 
 const device = '/dev/ttyUSB0'
 
+// See Table 29 in https://www.dvsinc.com/manuals/AMBE-3000R_manual.pdf
+const PACKET_TYPE_TO_ID = {
+    'control': 0x0,
+    'speech': 0x02,
+    'channel': 0x01
+} as const
+
+class SpeechDataPacket {
+    get data(): Buffer {
+        throw new Error('TODO')
+    }
+}
+
+class ChannelDataPacket {
+
+}
+
 const serialport = new SerialPort(device, {
     baudRate: 460800
 }, (err) => {
@@ -42,11 +59,11 @@ class DVstick30 {
         return this.#packets
     }
 
-    static encodePacket(payloadType: number, payload: Buffer): Buffer {
+    private static encodePacket(packetType: 'channel' | 'speech' | 'control', payload: Buffer): Buffer {
         const lengthBuffer = Buffer.alloc(2, 0)
         lengthBuffer.writeUInt16BE(payload.length)
         const payloadTypeBuffer = Buffer.alloc(1, 0)
-        payloadTypeBuffer.writeUInt8(payloadType)
+        payloadTypeBuffer.writeUInt8(PACKET_TYPE_TO_ID[packetType])
     
         return Buffer.concat([
             Buffer.from('61', 'hex'), // magic number   
@@ -57,7 +74,7 @@ class DVstick30 {
     }
 
     async setRateT (rate: number) {
-        this.#sp.write(DVstick30.encodePacket(0, Buffer.from('\x09' + String.fromCharCode(rate))))
+        this.#sp.write(DVstick30.encodePacket('control', Buffer.from('\x09' + String.fromCharCode(rate))))
 
         await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_RATET')))
     }
@@ -68,7 +85,7 @@ class DVstick30 {
 
     async init(): Promise<boolean> {
         const encoderAndDecoderInitialized = '\x03'
-        this.#sp.write(DVstick30.encodePacket(0, Buffer.from('\x0B' + encoderAndDecoderInitialized)))
+        this.#sp.write(DVstick30.encodePacket('control', Buffer.from('\x0B' + encoderAndDecoderInitialized)))
         const packet = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_INIT')))
 
         return (packet as ControlResponseInit).successfulInit
@@ -76,7 +93,7 @@ class DVstick30 {
 
     async getVersion () {
         const versionControl = '\x31'
-        this.#sp.write(DVstick30.encodePacket(0, Buffer.from(versionControl)))
+        this.#sp.write(DVstick30.encodePacket('control', Buffer.from(versionControl)))
 
         const reply = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_VERSTRING')))
 
@@ -85,18 +102,28 @@ class DVstick30 {
 
     async reset() {
         const reset = '\x33'
-        this.#sp.write(DVstick30.encodePacket(0, Buffer.from(reset)))
+        this.#sp.write(DVstick30.encodePacket('control', Buffer.from(reset)))
 
         await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_READY')))
     }
 
     async getProductId(): Promise<string> {
         const productId = '\x30'
-        this.#sp.write(DVstick30.encodePacket(0, Buffer.from(productId)))
+        this.#sp.write(DVstick30.encodePacket('control', Buffer.from(productId)))
 
         const reply = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'control-response' && packet.controlPacketType === 'PKT_PRODID')))
 
         return (reply as ControlResponseProductId).productId
+    }
+
+    async encodeSpeechPacket(speechPacket: SpeechDataPacket): Promise<ChannelDataPacket> {
+        const PKT_CHANNEL0 = Buffer.from('\x40\x00')
+        const SPEECHD = Buffer.concat([Buffer.from('\x00'), speechPacket.data])
+        const CMODE = Buffer.from('\x02\x00\x00\x00')
+        const TONE = Buffer.from('\x08\x00\x00\x00')
+        this.#sp.write(DVstick30.encodePacket('speech', Buffer.concat([ PKT_CHANNEL0, SPEECHD, CMODE, TONE ])))
+
+        throw new Error('Not implemented')
     }
 
     private addData(buf: Buffer) {
@@ -246,9 +273,9 @@ stick.packets.subscribe((packet) => console.log(packet))
         const productId = await stick.getProductId()
         console.log(`product id is ${productId}`)
     
-        console.log(`Init result: ${await stick.setRateT(33)}`)
+        console.log(`set rate result: ${await stick.setRateT(33)}`)
 
-        await stick.init()
+        console.log(`init result: ${await stick.init()}`)
     } catch (err) {
         console.error(err)
     } finally {

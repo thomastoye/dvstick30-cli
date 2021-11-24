@@ -5,7 +5,8 @@
   "license": "MIT",
   "dependencies": {
     "rxjs": "^7.4.0",
-    "serialport": "^9.2.5"
+    "serialport": "^9.2.5",
+    "wavefile": "^11.0.0"
   },
   "devDependencies": {
     "@types/node": "^16.11.6",
