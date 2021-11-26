@@ -1,7 +1,7 @@
 import { filter, firstValueFrom, Observable, Subject } from 'rxjs'
 import SerialPort from 'serialport'
-import { getWavChunks } from './wav-reader'
-import { setTimeout } from 'node:timers/promises'
+import { getWavChunks, writeWavChunks } from './wav'
+import { writeFile } from 'node:fs/promises'
 
 const device = '/dev/ttyUSB0'
 
@@ -10,13 +10,6 @@ const PACKET_TYPE_TO_ID = {
     'control': 0x0,
     'speech': 0x02,
     'channel': 0x01
-} as const
-
-// TODO Merge with above
-const DVSTICK_PACKET_TYPE = {
-    CONTROL: 0,
-    AMBE: 1,
-    PCM: 2
 } as const
 
 class SpeechDataPacket {
@@ -37,17 +30,23 @@ class SpeechDataPacket {
 
 class ChannelDataPacket {
     #data: Buffer
+    #numBits: number
 
-    private constructor(data: Buffer) {
+    private constructor(data: Buffer, numBits: number) {
         this.#data = data
+        this.#numBits = numBits
     }
 
-    static create(data: Buffer) {
-        return new ChannelDataPacket(data)
+    static create(data: Buffer, numBits: number) {
+        return new ChannelDataPacket(data, numBits)
     }
 
     get data(): Buffer {
         return this.#data
+    }
+
+    get numBits(): number {
+        return this.#numBits
     }
 }
 
@@ -84,6 +83,7 @@ class DVstick30 {
         return this.#packets
     }
 
+    /** Handles adding the magic number and packet length to prepare a packet for sending */
     private static encodePacket(packetType: 'channel' | 'speech' | 'control', payload: Buffer): Buffer {
         const lengthBuffer = Buffer.alloc(2, 0)
         lengthBuffer.writeUInt16BE(payload.length)
@@ -96,8 +96,6 @@ class DVstick30 {
             payloadTypeBuffer,
             payload
         ])
-
-        console.log('encoding', result)
 
         return result
     }
@@ -147,14 +145,23 @@ class DVstick30 {
 
     async encodeSpeechPacket(speechPacket: SpeechDataPacket): Promise<ChannelDataPacket> {
         const PKT_CHANNEL0 = Buffer.from('\x40')
-        const SPEECHD = Buffer.from([0, 160])
-        // const CMODE = Buffer.from('\x02\x00\x00\x00')
-        // const TONE = Buffer.from('\x08\x00\x00\x00')
+        const numSpeechSamples = Math.ceil(speechPacket.data.length / 2)
+        const SPEECHD = Buffer.from([0, numSpeechSamples])
         this.#sp.write(DVstick30.encodePacket('speech', Buffer.concat([ PKT_CHANNEL0, SPEECHD, speechPacket.data ])))
 
-        const reply = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'output-speech-packet')))
+        const reply = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'speech-data-packet-response')))
 
-        return (reply as OutputSpeechPacket).encodedSpeech
+        return (reply as SpeechDataPacketResponse).encodedSpeech
+    }
+
+    async decodeChannelPacket(channelPacket: ChannelDataPacket): Promise<SpeechDataPacket> {
+        // const PKT_CHANNEL0 = Buffer.from('\x40')
+        const CHAND = Buffer.from([1, channelPacket.data.length * 8])
+        this.#sp.write(DVstick30.encodePacket('channel', Buffer.concat([ /* PKT_CHANNEL0, */ CHAND, channelPacket.data ])))
+
+        const reply = await firstValueFrom(this.#packets.pipe(filter((packet) => packet.type === 'channel-data-packet-response')))
+
+        return (reply as ChannelDataPacketResponse).decodedSpeech
     }
 
     private addData(buf: Buffer) {
@@ -208,13 +215,33 @@ class DVstick30 {
 
     private decodePacket(packet: { type: number, payload: Buffer }): null | DecodedPacket {
         switch (packet.type) {
-            case DVSTICK_PACKET_TYPE.AMBE:
+            case PACKET_TYPE_TO_ID.channel:
+                if (packet.payload[0] !== 0x01) {
+                    throw new Error('Expected CHAND field identifier at payload position 0')
+                }
+
+                const numBits = packet.payload[1]
+
                 return {
-                        type: 'output-speech-packet',
-                        encodedSpeech: ChannelDataPacket.create(packet.payload)
+                        type: 'speech-data-packet-response',
+                        encodedSpeech: ChannelDataPacket.create(packet.payload.slice(2), numBits)
                     }
 
-            case DVSTICK_PACKET_TYPE.CONTROL:
+            case PACKET_TYPE_TO_ID.speech:
+                if (packet.payload[0] !== 0x00) {
+                    throw new Error('Expected SPEECHD field identifier at payload position 0')
+                }
+
+                if (packet.payload[1] * 2 !== packet.payload.length - 2) {
+                    throw new Error(`SPEECHD (number of samples) (=${packet.payload[1]} samples) did not match payload length (=${packet.payload.length - 2} bytes)`)
+                }
+
+                return {
+                    type: 'channel-data-packet-response',
+                    decodedSpeech: SpeechDataPacket.create(packet.payload.slice(2))
+                }
+
+            case PACKET_TYPE_TO_ID.control:
                 const fieldIdentifier = packet.payload[0]
                 const payload = packet.payload.slice(1)
 
@@ -262,11 +289,16 @@ class DVstick30 {
 
 const stick = new DVstick30(serialport)
 
-type DecodedPacket = ControlResponse | OutputSpeechPacket
+type DecodedPacket = ControlResponse | SpeechDataPacketResponse | ChannelDataPacketResponse
 
-type OutputSpeechPacket = {
-    type: 'output-speech-packet'
+type SpeechDataPacketResponse = {
+    type: 'speech-data-packet-response'
     encodedSpeech: ChannelDataPacket
+}
+
+type ChannelDataPacketResponse = {
+    type: 'channel-data-packet-response'
+    decodedSpeech: SpeechDataPacket
 }
 
 type ControlResponseProductId = {
@@ -304,10 +336,11 @@ type ControlResponse = ControlResponseVersion | ControlResponseRateT | ControlRe
     payload: Buffer
 }
 
-stick.packets.subscribe((packet) => console.log(packet))
+// stick.packets.subscribe((packet) => console.log(packet))
 
-const chunks = getWavChunks().map(chunk => SpeechDataPacket.create(chunk))
+const chunks = getWavChunks().slice(0, 500).map(chunk => SpeechDataPacket.create(chunk))
 const exampleSpeechDataPacket = SpeechDataPacket.create(Buffer.from('0000000100020003000400050006000700080009000A000B000C000D000E000F0010001100120013001400150001601700180019001A001B001C001D001E001F0020002100220023002400250026002700280029002A002B002C002D002E002F0030003100320033003400350036003700380039003A003B003C003D003E003F0040004100420043004400450046004700480049004A004B004C004D004E004F0050005100520053005400550056005700580059005A005B005C005D005E005F0060006100620063006400650066006700680069006A006B006C006D006E006F0070007100720073007400750076007700780079007A007B007C007D007E007F0080008100820083008400850086008700880089008A008B008C008D008E008F0090009100920093009400950096009700980099009A009B009C009D009E009F', 'hex'))
+// const exampleChannelDataPacket = ChannelDataPacket.create(Buffer.from('00112233445566778899', 'hex'), 80)
 
 ; (async () => {
     try {
@@ -326,12 +359,27 @@ const exampleSpeechDataPacket = SpeechDataPacket.create(Buffer.from('00000001000
         console.log('encoded speech result', encodedSpeech.data)
         console.log('encoded speech length', encodedSpeech.data.length)
 
-        // console.log((await stick.encodeSpeechPacket(chunks[0])).data)
-        // console.log((await stick.encodeSpeechPacket(chunks[1])).data)
-        // console.log((await stick.encodeSpeechPacket(chunks[2])).data)
-        // console.log((await stick.encodeSpeechPacket(chunks[0])).data)
-        // console.log((await stick.encodeSpeechPacket(chunks[1])).data)
-        // console.log((await stick.encodeSpeechPacket(chunks[1])).data.length)
+        let encodedChunks: ChannelDataPacket[] = []
+        for (const chunk of chunks) {
+            encodedChunks.push(await stick.encodeSpeechPacket(chunk))
+        }
+
+        let decodedChunks: SpeechDataPacket[] = []
+        for (const encoded of encodedChunks) {
+            decodedChunks.push(await stick.decodeChannelPacket(encoded))
+        }
+
+        console.log('chunk 100')
+        console.log(chunks[100].data)
+        console.log(decodedChunks[100].data)
+
+        // const decodedSpeech = await stick.decodeChannelPacket(exampleChannelDataPacket)
+
+        // console.log(decodedSpeech.data)
+        // console.log(decodedSpeech.data.length)
+
+        await writeFile('output.wav', writeWavChunks(decodedChunks.map(p => p.data)))
+        await writeFile('test.wav', writeWavChunks(chunks.map(p => p.data)))
         
         // await setTimeout(1000)
     } catch (err) {
@@ -340,16 +388,3 @@ const exampleSpeechDataPacket = SpeechDataPacket.create(Buffer.from('00000001000
         serialport.close()
     }
 })()
-
-
-
-// self._device_name = device
-// self._baudrate = baudrate
-// self._MODEL = 'AMBE3000R'
-// self.buffer = b''
-// self._start_byte = b'\x61'
-// self._TYPE_PCM = 0x2
-// self._TYPE_AMBE = 0x1
-// self._TYPE_CTRL = 0x0
-// self._type = { 'cfg':b'\x00', 'speech':b'\x02','channel':b'\x01' }
-
